@@ -31,6 +31,7 @@ Control scheme (same for each controller):
     Grip release -> freeze arm at current target
     Trigger    -> gripper position (0 = open, 1 = closed mapped to gripper_width)
     A button (right controller) -> reset both arms to initial pose (rising edge)
+    Y button (left controller)  -> advance to the next subtask while recording (rising edge)
 """
 
 import time
@@ -84,6 +85,7 @@ class BiPico4(Teleoperator):
 
         # Edge detection for the controller button currently used by teleop / record flows
         self._was_reset_button_pressed: bool = False
+        self._was_subtask_button_pressed: bool = False
 
         # Build per-arm Pico4 configs from shared BiPico4Config fields
         left_config = Pico4Config(
@@ -268,6 +270,7 @@ class BiPico4(Teleoperator):
             # "just pressed" event on the first poll_buttons() call.
             self.poll_buttons()
             self._was_reset_button_pressed = self._right_pico4._last_a_button
+            self._was_subtask_button_pressed = bool(xrt.get_Y_button())
 
             self.logger.info("BiPico4 connected (left + right controllers).")
 
@@ -370,6 +373,17 @@ class BiPico4(Teleoperator):
         current = self._right_pico4._last_a_button
         just_pressed = current and not self._was_reset_button_pressed
         self._was_reset_button_pressed = current
+        return just_pressed
+
+    def get_subtask_button(self) -> bool:
+        """Get rising-edge state of the Y button (left controller).
+
+        Reads the state the left Pico4 instance cached in the last get_action(),
+        so call it after get_action() each frame.
+        """
+        current = self._left_pico4._last_y_button
+        just_pressed = current and not self._was_subtask_button_pressed
+        self._was_subtask_button_pressed = current
         return just_pressed
 
     def send_feedback(self, feedback: dict[str, Any]) -> None:

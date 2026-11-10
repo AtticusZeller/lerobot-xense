@@ -316,7 +316,11 @@ class DatasetRecordConfig:
     # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
     repo_id: str
     # A short but accurate description of the task performed during the recording (e.g. "Pick the Lego block and drop it in the box on the right.")
-    single_task: str
+    single_task: str | None = None
+    # Ordered subtask prompts. When set, each frame's task is the current subtask instead of
+    # `single_task`: every episode starts on the first one and the teleop's subtask button
+    # advances to the next, stopping at the last. Requires an RT robot driven by bi_pico4.
+    subtasks: list[str] | None = None
     # Root directory where the dataset will be stored (e.g. 'dataset/path'). If None, defaults to $HF_LEROBOT_HOME/repo_id.
     root: str | Path | None = None
     # Limit the frames per second.
@@ -364,7 +368,10 @@ class DatasetRecordConfig:
     rename_map: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
-        if self.single_task is None:
+        if self.subtasks is not None:
+            if not self.subtasks or len(set(self.subtasks)) != len(self.subtasks):
+                raise ValueError(f"`subtasks` must be a non-empty list of distinct prompts, got {self.subtasks}.")
+        elif self.single_task is None:
             raise ValueError("You need to provide a task as argument in `single_task`.")
 
 
@@ -478,6 +485,43 @@ def record_loop(
         timestamp = time.perf_counter() - start_episode_t
 
 
+# Bimanual robots dispatched to run_rt_record_loop, the only loop that reads the subtask button.
+SUBTASK_RECORD_ROBOT_TYPES = frozenset({"bi_flexiv_rizon4_rt", "bi_elite_cs66_rt", "bi_rebot_b601_rt"})
+
+
+def _check_subtask_recording_supported(robot_type: str, teleop_type: str | None) -> None:
+    """Fail before any hardware connects if `dataset.subtasks` would be silently ignored."""
+    if robot_type not in SUBTASK_RECORD_ROBOT_TYPES or teleop_type != "bi_pico4":
+        raise ValueError(
+            "`dataset.subtasks` needs teleop.type 'bi_pico4' (left Y button) and robot.type in "
+            f"{sorted(SUBTASK_RECORD_ROBOT_TYPES)}, got robot.type={robot_type!r}, teleop.type={teleop_type!r}."
+        )
+
+
+class SubtaskCursor:
+    """The current subtask of an episode; only moves forward and stops at the last one."""
+
+    def __init__(self, subtasks: list[str]):
+        if not subtasks:
+            raise ValueError("SubtaskCursor needs at least one subtask")
+        self.subtasks = list(subtasks)
+        self.index = 0
+
+    @property
+    def task(self) -> str:
+        return self.subtasks[self.index]
+
+    def advance(self) -> bool:
+        """Move to the next subtask; return False when already on the last one."""
+        if self.index + 1 >= len(self.subtasks):
+            return False
+        self.index += 1
+        return True
+
+    def label(self) -> str:
+        return f"{self.index + 1}/{len(self.subtasks)} {self.task!r}"
+
+
 # --------------------------------------------------------------------------- #
 # What differs between the RT record loops
 # --------------------------------------------------------------------------- #
@@ -575,6 +619,7 @@ def run_rt_record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    subtasks: list[str] | None = None,
 ):
     """Record an episode from an arm that owns a background servo loop.
 
@@ -586,6 +631,9 @@ def run_rt_record_loop(
 
     ``policy`` supplies the two things that differ per rig: what counts as a
     reset request, and how the teleoperator is re-synced afterwards.
+
+    With ``subtasks``, each frame's task is the current subtask: the episode starts on
+    the first one and the teleop's subtask button advances it.
     """
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -600,6 +648,10 @@ def run_rt_record_loop(
     # per finished reset however often rt_moving is read; others report None.
     last_reset_generation = getattr(robot, "reset_generation", None)
     prev_observation_frame = None  # for shifted-frame logic during RT reset
+    cursor = SubtaskCursor(subtasks) if subtasks else None
+    frames_written = 0
+    if cursor is not None:
+        logger.info(f"Subtask {cursor.label()} at frame 0")
 
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
@@ -660,6 +712,14 @@ def run_rt_record_loop(
         if isinstance(teleop, Teleoperator):
             teleop_action = teleop.get_action()
 
+            # get_action() has just cached the controller buttons.
+            if cursor is not None and teleop.get_subtask_button():
+                if cursor.advance():
+                    logger.info(f"Subtask {cursor.label()} at frame {frames_written} ({timestamp:.1f}s)")
+                else:
+                    logger.warn(f"Subtask button ignored at frame {frames_written}: already on {cursor.label()}")
+            task = cursor.task if cursor is not None else single_task
+
             # Left as if/else on purpose: the branch decides whether the arm is
             # commanded at all, and send_action's side effect should be visible
             # as a statement rather than folded into an expression.
@@ -682,18 +742,20 @@ def run_rt_record_loop(
                     frame = {
                         **prev_observation_frame,
                         **action_frame,
-                        "task": single_task,
+                        "task": task,
                     }
                     dataset.add_frame(frame)
+                    frames_written += 1
                 elif not robot_is_moving:
                     # Normal teleop: direct frame (obs[t], sent_action[t]).
                     action_frame = build_dataset_frame(dataset.features, sent_action, prefix=ACTION)
                     frame = {
                         **current_observation_frame,
                         **action_frame,
-                        "task": single_task,
+                        "task": task,
                     }
                     dataset.add_frame(frame)
+                    frames_written += 1
 
             prev_observation_frame = current_observation_frame
             display_action = sent_action
@@ -735,6 +797,7 @@ def flexiv_rizon4_rt_record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    subtasks: list[str] | None = None,
 ):
     """Flexiv Rizon4 RT: reset comes from the keyboard."""
     run_rt_record_loop(
@@ -747,6 +810,7 @@ def flexiv_rizon4_rt_record_loop(
         control_time_s=control_time_s,
         single_task=single_task,
         display_data=display_data,
+        subtasks=subtasks,
     )
 
 
@@ -788,6 +852,7 @@ def rebot_b601_rt_record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    subtasks: list[str] | None = None,
 ):
     """Single/dual B601 recording through the shared RT loop."""
     from lerobot.robots.rebot_b601_rt.tactile_camera import wait_for_fresh_camera_frames
@@ -809,6 +874,7 @@ def rebot_b601_rt_record_loop(
         control_time_s=control_time_s if control_time_s is not None else float("inf"),
         single_task=single_task,
         display_data=display_data,
+        subtasks=subtasks,
     )
     # A phase may end mid-reset. Finish it before the generic preparation loop
     # sends commands, and keep the native command watchdog refreshed while waiting.
@@ -857,6 +923,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         cfg.robot.type == "bi_elite_cs66_rt" and getattr(cfg.robot, "native_collision_profile", None) is not None
     )
     use_raw_passthrough = _use_raw_passthrough_record(cfg.robot.type, teleop_type)
+    if cfg.dataset.subtasks is not None:
+        _check_subtask_recording_supported(cfg.robot.type, teleop_type)
 
     if use_raw_passthrough:
         dataset_features = _build_raw_passthrough_dataset_features(robot, cfg.dataset.video)
@@ -1061,6 +1129,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         control_time_s=cfg.dataset.episode_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        subtasks=cfg.dataset.subtasks,
                     )
                 elif cfg.robot.type in {"rebot_b601_rt", "bi_rebot_b601_rt"}:
                     rebot_b601_rt_record_loop(
@@ -1072,6 +1141,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         control_time_s=cfg.dataset.episode_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        subtasks=cfg.dataset.subtasks,
                     )
                 else:
                     record_loop(
