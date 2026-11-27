@@ -31,16 +31,13 @@ MAX_RESULT_AGE_S = 2.0
 
 class AlignmentResult(Protocol):
     @property
-    def status(self) -> str: ...
+    def reason(self) -> str: ...
 
     @property
     def passed(self) -> bool: ...
 
     @property
     def observed_outline(self) -> list[list[float]] | None: ...
-
-    @property
-    def iou(self) -> float | None: ...
 
 
 class AlignmentEvaluator(Protocol):
@@ -58,6 +55,11 @@ def dataset_revision(root: Path) -> str:
     return trees[0] if len(trees) == 1 else "local"
 
 
+def _validate_min_iou(value: object, field: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1:
+        raise ValueError(f"{field} must be in (0, 1]")
+
+
 def validate_thresholds(path: Path | None) -> None:
     if path is None:
         return
@@ -65,10 +67,15 @@ def validate_thresholds(path: Path | None) -> None:
         config = json.loads(path.read_bytes())
         if not isinstance(config, dict) or config.get("version") != 1:
             raise ValueError("expected alignment thresholds version 1")
-        iou = config["min_iou"]
-        if type(iou) not in (float, int) or not 0 < iou <= 1:
-            raise ValueError("min_iou must be in (0, 1]")
-    except (OSError, ValueError, KeyError) as exc:
+        _validate_min_iou(config.get("min_iou"), "min_iou")
+        per_object = config.get("per_object", {})
+        if not isinstance(per_object, dict):
+            raise ValueError("per_object must be an object mapping target names to min_iou values")
+        for name, value in per_object.items():
+            if not name.strip():
+                raise ValueError("per_object target names must be nonempty strings")
+            _validate_min_iou(value, f"per_object[{name!r}]")
+    except (OSError, ValueError) as exc:
         raise ValueError(f"Invalid collection alignment thresholds {path}: {exc}") from exc
 
 
@@ -151,7 +158,7 @@ def save_collection_episode(
 
 
 def is_manual(target: PlanTarget) -> bool:
-    return target["outline"] is None or target["object"] == "box_base"
+    return target["outline"] is None
 
 
 def _arrow_end(anchor: list[float], end: list[float], width: int, height: int) -> tuple[int, int]:
@@ -201,14 +208,16 @@ def draw_guide(
         label_pos = (min(anchor[0] + 8, width - 18), max(anchor[1] - 7, 20))
         cv2.putText(image, str(number), label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(image, str(number), label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.65, TARGET, 2, cv2.LINE_AA)
-        description = "manual" if manual else result.status if result else status
-        iou = f"{result.iou:.0%}" if result and result.iou is not None else "--"
+        description = "manual" if manual else result.reason if result else status
+        label = f"{number}. {target['object']}  |  {description}"
+        (label_width, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
+        scale = 0.50 * min(1, (canvas.shape[1] - 24) / label_width)
         cv2.putText(
             canvas,
-            f"{number}. {target['object']}  IoU {iou}  |  {description}",
+            label,
             (12, height + 42 + 22 * number),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
+            scale,
             color if result and not manual else TEXT,
             1,
             cv2.LINE_AA,

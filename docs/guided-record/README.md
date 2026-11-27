@@ -1,6 +1,6 @@
 # Guided recording
 
-Guided mode appends episodes to the local LeRobot dataset used to generate a reviewed [collection plan](https://github.com/AtticusZeller/lerobot-check/blob/3873cdf/docs/collection-plan.md). The recorder uses its own head camera; close any separate camera preview before starting. To record as usual, omit `--collection_plan`.
+Guided mode appends episodes to the local LeRobot dataset used to generate a reviewed [collection plan](https://github.com/AtticusZeller/lerobot-check/blob/b7060b102e50898b6929346dfdfe75c36acda532/docs/collection-plan.md). The recorder uses its own head camera; close any separate camera preview before starting. To record as usual, omit `--collection_plan`.
 
 ## Start a session
 
@@ -17,7 +17,7 @@ lerobot-record --config_path="$RECIPE" \
   --display_data=false --collection_plan="$PLAN"
 ```
 
-The recorder opens the guide before the first take and before every subsequent pending round. Reset does not time out. The guide shows the round and progress, numbered target outlines and arrows, and, when available, observed outlines and mask overlap (IoU). A green message and a spoken prompt (when `play_sounds` is on) indicate all targets reached the threshold. The score checks only the visible outline: confirm object identity and orientation yourself. A `box_base` target without an outline shows a point and arrow and always needs manual judgment.
+The recorder opens the guide before the first take and before every subsequent pending round. Reset does not time out. The guide shows the round and progress, numbered target outlines and arrows, and, when available, observed outlines and mask overlap (IoU). A green message and a spoken prompt (when `play_sounds` is on) indicate all targets reached the threshold. The score checks only the visible outline: confirm object identity and orientation yourself. A target without an outline shows a point and arrow and always needs manual judgment.
 
 | Key         | During reset                                                               | During recording                                           |
 | ----------- | -------------------------------------------------------------------------- | ---------------------------------------------------------- |
@@ -34,7 +34,7 @@ In the existing recorder environment, install the compatible `lerobot-check` bui
 
 ```bash
 uv pip install --no-deps \
-  'lerobot-check @ git+https://github.com/AtticusZeller/lerobot-check.git@433cd1fa53922f2f1c9ff4b80668d614226efaf6'
+  'lerobot-check @ git+https://github.com/AtticusZeller/lerobot-check.git@b7060b102e50898b6929346dfdfe75c36acda532'
 uv pip install 'transformers>=5.24.1,<6'
 hf download facebook/sam2.1-hiera-tiny config.json preprocessor_config.json \
   processor_config.json model.safetensors \
@@ -42,7 +42,13 @@ hf download facebook/sam2.1-hiera-tiny config.json preprocessor_config.json \
 python -c 'from lerobot_check.alignment import AlignmentEvaluator; AlignmentEvaluator.from_files(device="cuda")'
 ```
 
-The recorder does not download weights. A missing dependency, unavailable CUDA or failed inference leaves the target overlay and manual confirmation available. To use a different threshold, pass `--collection_alignment_thresholds=/path/thresholds.json`; the file format is `{"version": 1, "min_iou": 0.60}`. Omit the option to use the evaluator's default.
+The recorder does not download weights. A missing dependency, unavailable CUDA or failed inference leaves the target overlay and manual confirmation available. Omit `--collection_alignment_thresholds` to use the default threshold of 0.60 for every object. To override it, pass `--collection_alignment_thresholds=/path/thresholds.json`. An optional `per_object` map overrides `min_iou` for the named targets; files with just `version` and `min_iou` still work.
+
+```json
+{ "version": 1, "min_iou": 0.6, "per_object": { "box_lid": 0.5 } }
+```
+
+The guide compares each score to the threshold for that target. A score up to five percentage points below its threshold asks for visual confirmation without telling the operator to move the object. The example override is illustrative; keep the default until bench measurements support a change.
 
 ## Verify on the Flexiv bench
 
