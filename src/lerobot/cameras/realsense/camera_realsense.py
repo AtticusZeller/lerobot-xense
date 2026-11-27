@@ -17,6 +17,7 @@ Provides the RealSenseCamera class for capturing frames from Intel RealSense cam
 """
 
 import time
+from importlib import import_module
 from threading import Event, Lock, Thread
 from typing import Any
 
@@ -155,6 +156,17 @@ class RealSenseCamera(Camera):
     def is_connected(self) -> bool:
         """Checks if the camera pipeline is started and streams are active."""
         return self.rs_pipeline is not None and self.rs_profile is not None
+
+    def native_rgb_identity(self) -> tuple[str, tuple[int, int]]:
+        """Return the connected device serial and native, unrotated RGB stream size."""
+        if self.rs_profile is None:
+            raise DeviceNotConnectedError(f"{self}: no active RealSense profile")
+        if self.rotation is not None or self.color_mode != ColorMode.RGB:
+            raise ValueError(f"{self}: collection guidance requires unrotated RGB frames")
+        sdk = import_module("pyrealsense2")
+        serial = self.rs_profile.get_device().get_info(sdk.camera_info.serial_number)
+        stream = self.rs_profile.get_stream(sdk.stream.color).as_video_stream_profile()
+        return serial, (stream.width(), stream.height())
 
     @check_if_already_connected
     def connect(self, warmup: bool = True) -> None:
