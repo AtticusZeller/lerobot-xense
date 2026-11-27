@@ -279,7 +279,8 @@ def test_failed_save_or_footer_never_marks_progress(record_setup, monkeypatch, s
 
 
 @pytest.mark.parametrize(
-    "kind", ["serial", "profile", "frame", "revision", "count", "exhausted_count", "malformed", "thresholds"]
+    "kind",
+    ["serial", "profile", "frame", "revision", "count", "exhausted_count", "malformed", "thresholds", "per_object"],
 )
 def test_refuses_mismatches_without_writing(record_setup, kind):
     cfg, robot, _, window = record_setup
@@ -297,9 +298,14 @@ def test_refuses_mismatches_without_writing(record_setup, kind):
     elif kind == "exhausted_count":
         for i, round_ in enumerate(plan["rounds"], 1):
             round_.update(status="collected", episode_index=i)
-    elif kind == "thresholds":
+    elif kind in {"thresholds", "per_object"}:
         cfg.collection_alignment_thresholds = cfg.collection_plan.with_name("thresholds.json")
-        cfg.collection_alignment_thresholds.write_text('{"version": 1, "min_iou": 2}')
+        threshold_config = (
+            '{"version": 1, "min_iou": 2}'
+            if kind == "thresholds"
+            else '{"version": 1, "min_iou": 0.60, "per_object": {"box_lid": true}}'
+        )
+        cfg.collection_alignment_thresholds.write_text(threshold_config)
     plan_bytes = b"{" if kind == "malformed" else json_bytes(plan)
     cfg.collection_plan.write_bytes(plan_bytes)
     with pytest.raises(ValueError):
@@ -307,6 +313,38 @@ def test_refuses_mismatches_without_writing(record_setup, kind):
     assert cfg.collection_plan.read_bytes() == plan_bytes
     assert read_episode_indices(cfg.dataset.root / "meta/episodes") == [[0]]
     assert not window.open and not robot.is_connected
+
+
+@pytest.mark.parametrize(
+    "config",
+    ['{"version": 1, "min_iou": 0.60}', '{"version": 1, "min_iou": 0.60, "per_object": {"box_lid": 0.50}}'],
+)
+def test_accepts_legacy_and_per_object_threshold_files(tmp_path, config):
+    path = tmp_path / "thresholds.json"
+    path.write_text(config)
+    guide_mod.validate_thresholds(path)
+
+
+def test_outline_drives_inference_and_window_shows_evaluator_reason(monkeypatch):
+    round_ = make_plan(1)["rounds"][0]
+    target: PlanTarget = {**TARGET, "object": "box_base"}
+    round_["targets"] = [target]
+    reason = "Mask IoU 49.0% just below 50.0%; confirm placement visually"
+    result = SimpleNamespace(reason=reason, passed=False, observed_outline=target["outline"])
+    labels = []
+    put_text = cv2.putText
+
+    def capture(canvas, text, origin, font, scale, color, thickness, line_type):
+        labels.append(text)
+        (width, _), _ = cv2.getTextSize(text, font, scale, thickness)
+        assert origin[0] + width <= canvas.shape[1]
+        return put_text(canvas, text, origin, font, scale, color, thickness, line_type)
+
+    monkeypatch.setattr(cv2, "putText", capture)
+    assert not guide_mod.is_manual(target)
+    guide_mod.draw_guide(FRAME, round_, "Round 1", [result], "waiting for alignment", False)
+    assert f"1. box_base  |  {reason}" in labels
+    assert "Enter to confirm manually | Esc to stop" in labels
 
 
 def test_local_only_does_not_download(tmp_path, monkeypatch):
@@ -400,8 +438,7 @@ def test_alignment_only_announces_fresh_complete_result(record_setup, monkeypatc
     @dataclass
     class Match:
         passed: bool = True
-        status: str = "aligned"
-        iou: float = 1.0
+        reason: str = "Mask IoU 100.0% meets 60.0%"
         observed_outline: list[list[float]] | None = None
 
     with ThreadPoolExecutor(1) as executor:
