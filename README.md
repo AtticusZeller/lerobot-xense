@@ -218,6 +218,7 @@ ls recipes/teleop/bi_elite_cs66_rt/     # diagonal-07, diagonal-08
 
 Precedence is `dataclass default < recipe < CLI`, so an explicit
 `--robot.left_robot_sn=…` overrides the recipe for a one-off run.
+For reviewed placement plans and local-only append, see [Guided recording](docs/guided-record/README.md).
 
 **Gripper (`gripper:`).** Every robot takes one typed gripper block; a bimanual arm
 writes it once and both sides get a copy with `side` stamped in (the two are always

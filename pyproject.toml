@@ -295,6 +295,7 @@ known-first-party = ["lerobot"]
 convention = "google"
 
 [tool.ruff.format]
+exclude = ["src/lerobot/utils/collection_progress.py"]
 quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false

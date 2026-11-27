@@ -94,6 +94,8 @@ class LeRobotDatasetMetadata:
         revision: str | None = None,
         force_cache_sync: bool = False,
         metadata_buffer_size: int = 10,
+        *,
+        local_files_only: bool = False,
     ):
         self.repo_id = repo_id
         self.revision = revision if revision else CODEBASE_VERSION
@@ -102,12 +104,15 @@ class LeRobotDatasetMetadata:
         self.latest_episode = None
         self.metadata_buffer: list[dict] = []
         self.metadata_buffer_size = metadata_buffer_size
+        self._rotate_episode_shard = False
 
         try:
             if force_cache_sync:
                 raise FileNotFoundError
             self.load_metadata()
         except (FileNotFoundError, NotADirectoryError):
+            if local_files_only:
+                raise
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
 
@@ -372,7 +377,10 @@ class LeRobotDatasetMetadata:
                 else self.writer.where
             )
 
-            if Path(latest_path).exists():
+            if self._rotate_episode_shard:
+                chunk_idx, file_idx = update_chunk_file_indices(chunk_idx, file_idx, self.chunks_size)
+                self._rotate_episode_shard = False
+            elif Path(latest_path).exists():
                 latest_size_in_mb = get_file_size_in_mb(Path(latest_path))
                 latest_num_frames = self.latest_episode["episode_index"][0]
 
@@ -558,6 +566,7 @@ class LeRobotDatasetMetadata:
         obj.latest_episode = None
         obj.metadata_buffer = []
         obj.metadata_buffer_size = metadata_buffer_size
+        obj._rotate_episode_shard = False
         return obj
 
 
@@ -595,6 +604,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        *,
+        local_files_only: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -696,6 +707,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 multiples of 1/fps. Defaults to 1e-4.
             revision (str, optional): An optional Git revision id which can be a branch name, a tag, or a
                 commit hash. Defaults to current codebase version tag.
+            local_files_only (bool): Fail rather than download files needed to load the dataset.
             force_cache_sync (bool, optional): Flag to sync and refresh local files first. If True and files
                 are already present in the local cache, this will be faster. However, files loaded might not
                 be in sync with the version on the hub, especially if you specified 'revision'. Defaults to
@@ -744,7 +756,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.root.mkdir(exist_ok=True, parents=True)
 
         # Load metadata
-        self.meta = LeRobotDatasetMetadata(self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync)
+        self.meta = LeRobotDatasetMetadata(
+            self.repo_id, self.root, self.revision, force_cache_sync=force_cache_sync, local_files_only=local_files_only
+        )
 
         # Track dataset state for efficient incremental writing
         self._lazy_loading = False
@@ -760,6 +774,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if not self._check_cached_episodes_sufficient():
                 raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
         except (FileNotFoundError, NotADirectoryError):
+            if local_files_only:
+                raise
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
             self.download(download_videos)
@@ -1255,6 +1271,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 self.episode_buffer[key].append(frame[key])
 
         self.episode_buffer["size"] += 1
+
+    def close_episode_parquet(self) -> None:
+        """Finish the current Parquet shards so a saved episode is readable before finalization."""
+        self._close_writer()
+        self.meta._close_writer()
+        self._writer_closed_for_reading = True
+        self.meta._rotate_episode_shard = True
 
     def save_episode(
         self,

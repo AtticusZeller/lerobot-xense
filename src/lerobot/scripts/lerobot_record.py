@@ -124,6 +124,17 @@ from lerobot.robots import (  # noqa: F401
     flexiv_rizon4_rt,
     make_robot_from_config,
 )
+from lerobot.scripts.collection_guide import (
+    CollectionGuide,
+    ResetGuide,
+    head_key,
+    require_gui,
+    save_collection_episode,
+    validate_camera,
+    validate_dataset,
+    validate_dataset_contents,
+    validate_thresholds,
+)
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -134,7 +145,8 @@ from lerobot.teleoperators import (  # noqa: F401
     spacemouse,
     trlc_leader,
 )
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.collection_progress import next_pending, plan_session
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -384,10 +396,24 @@ class RecordConfig:
     play_sounds: bool = True
     # Resume recording on an existing dataset.
     resume: bool = False
+    collection_plan: Path | None = None
+    collection_alignment_thresholds: Path | None = None
 
     def __post_init__(self):
         if self.teleop is None:
             raise ValueError("A teleoperator configuration is required to control the robot.")
+        if self.collection_plan is None:
+            if self.collection_alignment_thresholds is not None:
+                raise ValueError("--collection_alignment_thresholds requires --collection_plan")
+        elif (
+            not self.resume
+            or self.dataset.push_to_hub
+            or (self.dataset.video and self.dataset.video_encoding_batch_size != 1)
+        ):
+            raise ValueError(
+                "--collection_plan requires --resume=true, --dataset.push_to_hub=false, "
+                "and per-episode video encoding (--dataset.video_encoding_batch_size=1)"
+            )
 
 
 """ --------------- record_loop() data flow --------------------------
@@ -412,10 +438,11 @@ def record_loop(
     fps: int,
     dataset: LeRobotDataset | None = None,
     teleop: Teleoperator | list[Teleoperator] | None = None,
-    control_time_s: int | None = None,
+    control_time_s: int | float | None = None,
     single_task: str | None = None,
     display_data: bool = False,
     display_compressed_images: bool = True,
+    reset_guide: ResetGuide | None = None,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -423,10 +450,16 @@ def record_loop(
     no_action_count = 0
     timestamp = 0
     start_episode_t = time.perf_counter()
+    assert control_time_s is not None
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
-        if events["exit_early"]:
+        if reset_guide is not None:
+            if events["stop_recording"]:
+                break
+            events["exit_early"] = False
+            events["rerecord_episode"] = False
+        elif events["exit_early"]:
             events["exit_early"] = False
             break
 
@@ -462,6 +495,9 @@ def record_loop(
 
         if display_data:
             log_rerun_data(observation=obs, action=action_values, compress_images=display_compressed_images)
+
+        if reset_guide is not None and not reset_guide.tick(obs, robot_moving=getattr(robot, "rt_moving", False)):
+            break
 
         dt_s = time.perf_counter() - start_loop_t
 
@@ -740,8 +776,31 @@ def elite_cs66_rt_record_loop(
 
 @parser.wrap()
 def record(cfg: RecordConfig) -> LeRobotDataset:
+    with contextlib.ExitStack() as resources:
+        return _record(cfg, resources)
+
+
+def _record(cfg: RecordConfig, resources: contextlib.ExitStack) -> LeRobotDataset:
     init_logging()
     logger.info(pformat(asdict(cfg)))
+    session = None
+    plan = None
+    guide = None
+    round_ = None
+    root = cfg.dataset.root
+    if cfg.collection_plan is not None:
+        session = resources.enter_context(plan_session(cfg.collection_plan))
+        plan = session.read()
+        root = Path(root).expanduser().resolve() if root is not None else HF_LEROBOT_HOME / cfg.dataset.repo_id
+        validate_dataset(plan, cfg.dataset.repo_id, root)
+        validate_thresholds(cfg.collection_alignment_thresholds)
+        round_ = next_pending(plan)
+        if round_ is not None and cfg.dataset.num_episodes > 0:
+            require_gui()
+            if is_headless():
+                raise RuntimeError("Guided recording requires working lerobot-record keyboard shortcuts")
+            executor = resources.enter_context(ThreadPoolExecutor(max_workers=1, thread_name_prefix="collection"))
+            guide = CollectionGuide(executor, cfg.collection_alignment_thresholds, cfg.play_sounds)
     if cfg.display_data:
         init_rerun(session_name="recording", ip=cfg.display_ip, port=cfg.display_port)
     display_compressed_images = (
@@ -782,12 +841,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if cfg.resume:
             dataset = LeRobotDataset(
                 cfg.dataset.repo_id,
-                root=cfg.dataset.root,
+                root=root,
                 batch_encoding_size=cfg.dataset.video_encoding_batch_size,
                 vcodec=cfg.dataset.vcodec,
                 streaming_encoding=cfg.dataset.streaming_encoding,
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
                 encoder_threads=cfg.dataset.encoder_threads,
+                local_files_only=session is not None,
             )
 
             if hasattr(robot, "cameras") and len(robot.cameras) > 0:
@@ -814,6 +874,12 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
                 encoder_threads=cfg.dataset.encoder_threads,
             )
+
+        if plan is not None:
+            validate_dataset_contents(plan, dataset)
+            if guide is None:
+                logger.info("No collection rounds to record")
+                return dataset
 
         # Vendor-specific robot.connect dispatch
         if teleop_type == "pico4" and cfg.robot.type == "flexiv_rizon4_rt":
@@ -844,6 +910,9 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             logger.info("Start pose: " + ", ".join(f"{k}={start_obs[k]:.6f}" for k in tcp_keys))
         else:
             robot.connect()
+
+        if plan is not None:
+            validate_camera(plan, getattr(robot, "cameras", {}).get(head_key(plan)))
 
         # Vendor-specific teleop.connect dispatch
         if teleop is not None:
@@ -876,10 +945,30 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         with VideoEncodingManager(dataset):
             recorded_episodes = 0
             while recorded_episodes < cfg.dataset.num_episodes and not events["stop_recording"]:
+                if guide is not None:
+                    if round_ is None:
+                        break
+                    assert plan is not None
+                    log_say(f"Reset the environment for collection round {round_['id']}", cfg.play_sounds)
+                    with guide.reset(plan, round_) as reset:
+                        record_loop(
+                            robot=robot,
+                            events=events,
+                            fps=cfg.dataset.fps,
+                            teleop=teleop,
+                            control_time_s=float("inf"),
+                            reset_guide=reset,
+                        )
+                    if not reset.accepted or events["stop_recording"]:
+                        break
+
                 # Warm up the streaming encoder before the loop so the first frame
                 # doesn't overrun on encoder/codec initialization.
                 if dataset is not None:
                     dataset.prepare_episode_recording()
+
+                if guide is not None and events["stop_recording"]:
+                    break
 
                 # Discard any exit request that arrived while nothing was
                 # reading events. The keyboard listener runs for the whole
@@ -959,8 +1048,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                 # Execute a few seconds without recording to give time to manually reset the environment
                 # Skip reset for the last episode to be recorded
-                if not events["stop_recording"] and (
-                    (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                if (
+                    guide is None
+                    and not events["stop_recording"]
+                    and ((recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"])
                 ):
                     log_say("Reset the environment", cfg.play_sounds)
 
@@ -981,7 +1072,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     dataset.clear_episode_buffer()
                     continue
 
-                dataset.save_episode()
+                if guide is None:
+                    dataset.save_episode()
+                else:
+                    assert session is not None and plan is not None and round_ is not None
+                    if events["stop_recording"] and not (dataset.episode_buffer and dataset.episode_buffer["size"]):
+                        break
+                    plan = save_collection_episode(dataset, session, plan, round_["id"])
+                    round_ = next_pending(plan)
                 recorded_episodes += 1
     except KeyboardInterrupt:
         # Ctrl+C is how an operator ends a session, not a failure. Logging it
